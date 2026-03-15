@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "start": "node Premeasure_pr.js",
+    "measure": "node Premeasure_pr.js",
+    "measure:one": "ONE_TRIAL_ONLY=1 node Premeasure_pr.js",
+    "measure:cancel-delay": "SCENARIO=cancel_delay node Premeasure_pr.js"
+  },
+  "dependencies": {
+    "puppeteer": "^24.39.1"
+  }
+}

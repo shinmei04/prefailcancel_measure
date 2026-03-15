@@ -15,6 +15,23 @@ const WAIT_TIME = 2000; // Home滞在時間 (ms)
 const TRIAL_TIMEOUT_MS = 120000; // 1試行の上限時間
 const HOME_URL = 'https://home.lab-ish.com/index.html';
 const PR_MONITOR_MODE = (process.env.PR_MONITOR_MODE || 'full').toLowerCase(); // 'full' or 'status-only'
+// 計測シナリオ切り替え: default は従来計測、cancel_delay は depth click 後の attack 停止遅延を計測
+const SCENARIO = (process.env.SCENARIO || 'default').toLowerCase(); // default | cancel_delay
+const CLICK_SELECTOR_DEPTH = process.env.CLICK_SELECTOR_DEPTH || '#link-medium';
+const ATTACK_URL_PREFIX = 'https://attack.lab-ish.com/';
+const ATTACK_ORIGIN = new URL(ATTACK_URL_PREFIX).origin;
+
+const parsePositiveInt = (raw) => {
+    const value = Number.parseInt(raw || '', 10);
+    return Number.isInteger(value) && value > 0 ? value : null;
+};
+
+// デバッグ用: 試行回数を環境変数で上書き可能
+const TRIAL_COUNT_OVERRIDE = parsePositiveInt(process.env.TRIAL_COUNT_OVERRIDE);
+const ONE_TRIAL_ONLY = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.ONE_TRIAL_ONLY || process.env.TRIAL_ONE_SHOT || '').toLowerCase()
+);
+const EFFECTIVE_TRIAL_COUNT = ONE_TRIAL_ONLY ? 1 : (TRIAL_COUNT_OVERRIDE || TRIAL_COUNT);
 
 // Condition は tc 側のプロファイル名ラベルとして使用（必要に応じて追加）
 const NETWORK_CONDITIONS = {
@@ -26,6 +43,11 @@ const TARGETS = [
     { name: 'Medium', url: 'https://depth.lab-ish.com/', id: '#link-medium' },
     { name: 'Heavy', url: 'https://attack.lab-ish.com/', id: '#link-heavy' }
 ];
+const CANCEL_DELAY_CLICK_TARGET = {
+    name: 'Depth',
+    url: 'https://depth.lab-ish.com/',
+    id: CLICK_SELECTOR_DEPTH
+};
 
 // CLI/TARGETS env で Light/Medium/Heavy を絞り込み
 const targetsToMeasure = (() => {
@@ -74,6 +96,83 @@ const createPrStatusState = (url) => ({
     failReason: null // e.g., DevToolsDisabled
 });
 
+// attack 側通信の識別は prefix 優先 + origin fallback で行う
+const isAttackUrl = (url = '') => {
+    if (!url) return false;
+    if (url.startsWith(ATTACK_URL_PREFIX)) return true;
+    try {
+        return new URL(url).origin === ATTACK_ORIGIN;
+    } catch {
+        return false;
+    }
+};
+
+const createAttackMonitorState = () => ({
+    requests: new Map(), // key: sessionId:requestId
+    sessionRequestKeys: new Map(), // sessionId -> Map(requestId -> key)
+    detachAt: null,
+    events: []
+});
+
+const toAttackCsvFields = (trial) => {
+    if (!trial || !trial.attackMonitor) {
+        return [SCENARIO, '', '', '', '', '', '', '', ''];
+    }
+
+    const clickedAt = trial.clickedAt;
+    const monitor = trial.attackMonitor;
+    const requests = Array.from(monitor.requests.values());
+    const filterAfterClick = (ts) => (clickedAt ? ts >= clickedAt : true);
+    const byTs = (a, b, key) => (a[key] || Number.MAX_SAFE_INTEGER) - (b[key] || Number.MAX_SAFE_INTEGER);
+
+    // 停止時刻の優先順位: canceled loadingFailed > loadingFinished > prerender target detach
+    const canceledCandidates = requests
+        .filter((r) => r.canceled === true && r.failed_at && filterAfterClick(r.failed_at))
+        .sort((a, b) => byTs(a, b, 'failed_at'));
+    const finishedCandidates = requests
+        .filter((r) => r.finished_at && filterAfterClick(r.finished_at))
+        .sort((a, b) => byTs(a, b, 'finished_at'));
+
+    let stoppedAt = null;
+    let canceled = '';
+    let result = 'none';
+    let error = '';
+
+    if (canceledCandidates.length > 0) {
+        stoppedAt = canceledCandidates[0].failed_at;
+        canceled = true;
+        result = 'canceled';
+        error = canceledCandidates[0].errorText || '';
+    } else if (finishedCandidates.length > 0) {
+        stoppedAt = finishedCandidates[0].finished_at;
+        canceled = false;
+        result = 'finished';
+        error = finishedCandidates[0].errorText || '';
+    } else if (monitor.detachAt && filterAfterClick(monitor.detachAt)) {
+        stoppedAt = monitor.detachAt;
+        canceled = '';
+        result = 'detached';
+        error = '';
+    }
+
+    const cancelDelay = clickedAt && stoppedAt ? stoppedAt - clickedAt : '';
+    const transferBytes = requests.reduce((sum, r) => sum + (r.bytes || 0), 0);
+    const transferKB = requests.length > 0 ? (transferBytes / 1024).toFixed(2) : '';
+    const eventsJson = monitor.events.length > 0 ? JSON.stringify(monitor.events) : '';
+
+    return [
+        SCENARIO,
+        clickedAt || '',
+        stoppedAt || '',
+        canceled,
+        result,
+        error,
+        cancelDelay,
+        transferKB,
+        eventsJson
+    ];
+};
+
 (async () => {
     const header = [
         'Condition',
@@ -96,7 +195,16 @@ const createPrStatusState = (url) => ({
         'PR_T2_HTTPStatus',
         'PR_T2_Error',
         'PR_T2_Duration_ms',
-        'PR_T2_Transfer_KB'
+        'PR_T2_Transfer_KB',
+        'Scenario',
+        'Clicked_At',
+        'PR_Attack_Stopped_At',
+        'PR_Attack_Canceled',
+        'PR_Attack_Result',
+        'PR_Attack_Error',
+        'PR_Attack_CancelDelay_ms',
+        'PR_Attack_Transfer_KB',
+        'PR_Attack_Events_JSON'
     ].join(',');
     fs.writeFileSync(OUTPUT_FILE, `${header}\n`);
 
@@ -114,12 +222,13 @@ const createPrStatusState = (url) => ({
         waitForDebuggerOnStart: false
     });
 
-    console.log(`=== tc帯域制御 前提の通常遷移計測開始(Prerender裏通信ログ付): ${TRIAL_COUNT}回計測 (Wait: ${WAIT_TIME}ms) ===`);
+    console.log(`=== tc帯域制御 前提の通常遷移計測開始(Prerender裏通信ログ付): ${EFFECTIVE_TRIAL_COUNT}回計測 (Wait: ${WAIT_TIME}ms, Scenario: ${SCENARIO}) ===`);
     console.log(`データは ${OUTPUT_FILE} に順次書き込まれます...\n`);
 
     let currentTrial = null;
     const sessionIdToReqMap = new Map(); // sessionId -> { reqMap: Map }
     const prerenderSessionIds = new Set();
+    const attackSessionCleanupMap = new Map(); // sessionId -> cleanup fn
 
     const findTargetIndex = (url = '') => {
         if (!currentTrial) return -1;
@@ -237,6 +346,133 @@ const createPrStatusState = (url) => ({
         };
     };
 
+    const attachAttackListenersForPrerenderSession = (session, sessionId) => {
+        if (!currentTrial || !currentTrial.attackMonitor) return null;
+
+        const trialRef = currentTrial;
+        const monitor = trialRef.attackMonitor;
+        const reqKeyMap = new Map();
+        monitor.sessionRequestKeys.set(sessionId, reqKeyMap);
+
+        // JSON保存用の時系列イベントログ
+        const pushAttackEvent = (payload) => {
+            if (!currentTrial || currentTrial !== trialRef) return;
+            monitor.events.push({
+                timestamp: Date.now(),
+                clicked_at: trialRef.clickedAt || null,
+                ...payload
+            });
+        };
+
+        // requestId 単位で attack 通信の生存期間と転送量を保持
+        const ensureRequestState = ({ requestId, url, resourceType }) => {
+            const key = `${sessionId}:${requestId}`;
+            if (!monitor.requests.has(key)) {
+                monitor.requests.set(key, {
+                    requestId,
+                    url: url || '',
+                    resourceType: resourceType || 'Unknown',
+                    started_at: null,
+                    finished_at: null,
+                    failed_at: null,
+                    canceled: false,
+                    errorText: null,
+                    bytes: 0,
+                    sessionId
+                });
+            }
+            reqKeyMap.set(requestId, key);
+            return monitor.requests.get(key);
+        };
+
+        const getRequestState = (requestId) => {
+            const key = reqKeyMap.get(requestId);
+            if (!key) return null;
+            return monitor.requests.get(key) || null;
+        };
+
+        const onRequestWillBeSent = (params) => {
+            if (!currentTrial || currentTrial !== trialRef) return;
+            const url = params.request?.url || '';
+            if (!isAttackUrl(url)) return;
+            const req = ensureRequestState({ requestId: params.requestId, url, resourceType: params.type });
+            if (!req.started_at) req.started_at = Date.now();
+            pushAttackEvent({
+                event_type: 'requestWillBeSent',
+                requestId: params.requestId,
+                sessionId,
+                url,
+                resourceType: req.resourceType,
+                canceled: null,
+                bytes: req.bytes
+            });
+        };
+
+        const onDataReceived = (params) => {
+            if (!currentTrial || currentTrial !== trialRef) return;
+            const req = getRequestState(params.requestId);
+            if (!req) return;
+            req.bytes += params.dataLength || 0;
+            pushAttackEvent({
+                event_type: 'dataReceived',
+                requestId: params.requestId,
+                sessionId,
+                url: req.url,
+                resourceType: req.resourceType,
+                canceled: null,
+                bytes: req.bytes
+            });
+        };
+
+        const onLoadingFinished = (params) => {
+            if (!currentTrial || currentTrial !== trialRef) return;
+            const req = getRequestState(params.requestId);
+            if (!req) return;
+            req.finished_at = Date.now();
+            req.bytes = Math.max(req.bytes, params.encodedDataLength || 0);
+            pushAttackEvent({
+                event_type: 'loadingFinished',
+                requestId: params.requestId,
+                sessionId,
+                url: req.url,
+                resourceType: req.resourceType,
+                canceled: false,
+                bytes: req.bytes
+            });
+        };
+
+        const onLoadingFailed = (params) => {
+            if (!currentTrial || currentTrial !== trialRef) return;
+            const req = getRequestState(params.requestId);
+            if (!req) return;
+            req.failed_at = Date.now();
+            req.canceled = !!params.canceled;
+            req.errorText = params.errorText || null;
+            pushAttackEvent({
+                event_type: 'loadingFailed',
+                requestId: params.requestId,
+                sessionId,
+                url: req.url,
+                resourceType: req.resourceType,
+                canceled: req.canceled,
+                bytes: req.bytes
+            });
+        };
+
+        session.on('Network.requestWillBeSent', onRequestWillBeSent);
+        session.on('Network.dataReceived', onDataReceived);
+        session.on('Network.loadingFinished', onLoadingFinished);
+        session.on('Network.loadingFailed', onLoadingFailed);
+
+        return () => {
+            session.off('Network.requestWillBeSent', onRequestWillBeSent);
+            session.off('Network.dataReceived', onDataReceived);
+            session.off('Network.loadingFinished', onLoadingFinished);
+            session.off('Network.loadingFailed', onLoadingFailed);
+            monitor.sessionRequestKeys.delete(sessionId);
+        };
+    };
+
     const handleAttachedToTarget = async (params) => {
         if (params.targetInfo?.subtype !== 'prerender') return;
         const session = connection.session(params.sessionId);
@@ -246,17 +482,47 @@ const createPrStatusState = (url) => ({
         prerenderSessionIds.add(params.sessionId);
         try {
             await session.send('Network.enable');
-            await session.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => {});
-            await session.send('Preload.enable').catch(() => {});
-            await session.send('Runtime.runIfWaitingForDebugger').catch(() => {});
+            await session.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => { });
+            await session.send('Preload.enable').catch(() => { });
+            await session.send('Runtime.runIfWaitingForDebugger').catch(() => { });
         } catch (e) {
             // ignore
         }
         const cleanup = statusOnly ? null : attachNetworkListenersForSession(session, prIndex === -1 ? null : prIndex);
+        const attackCleanup = attachAttackListenersForPrerenderSession(session, params.sessionId);
+        if (attackCleanup) {
+            attackSessionCleanupMap.set(params.sessionId, attackCleanup);
+        }
         session.on('Target.detachedFromTarget', () => cleanup && cleanup());
     };
 
     const handleDetachedFromTarget = (params) => {
+        const shouldCaptureAttackDetach =
+            !!(currentTrial && currentTrial.attackMonitor && currentTrial.attackMonitor.sessionRequestKeys.has(params.sessionId));
+
+        if (shouldCaptureAttackDetach) {
+            // stop event が取れなかった場合の補助時刻として detach を残す
+            const monitor = currentTrial.attackMonitor;
+            monitor.detachAt = Date.now();
+            monitor.events.push({
+                timestamp: monitor.detachAt,
+                event_type: 'Target.detachedFromTarget',
+                requestId: null,
+                sessionId: params.sessionId,
+                url: params.targetInfo?.url || '',
+                resourceType: null,
+                canceled: null,
+                bytes: null,
+                clicked_at: currentTrial.clickedAt || null
+            });
+        }
+
+        const attackCleanup = attackSessionCleanupMap.get(params.sessionId);
+        if (attackCleanup) {
+            attackCleanup();
+            attackSessionCleanupMap.delete(params.sessionId);
+        }
+
         if (statusOnly) return;
         if (!prerenderSessionIds.has(params.sessionId)) return;
         const data = sessionIdToReqMap.get(params.sessionId);
@@ -283,8 +549,11 @@ const createPrStatusState = (url) => ({
     browserSession.on('Target.attachedToTarget', handleAttachedToTarget);
     browserSession.on('Target.detachedFromTarget', handleDetachedFromTarget);
 
+    // cancel_delay は「depth を実クリック先」に固定し、attack 側 prerender 通信停止を観測
+    const runTargets = SCENARIO === 'cancel_delay' ? [CANCEL_DELAY_CLICK_TARGET] : targetsToMeasure;
+
     for (const [conditionName] of Object.entries(NETWORK_CONDITIONS)) {
-        for (const target of targetsToMeasure) {
+        for (const target of runTargets) {
             console.log(`[${conditionName}] - ${target.name} 測定中...`);
             let consecutiveFailures = 0;
 
@@ -296,10 +565,10 @@ const createPrStatusState = (url) => ({
             };
             browser.on('targetcreated', handleTargetCreated);
 
-            for (let i = 1; i <= TRIAL_COUNT; i++) {
+            for (let i = 1; i <= EFFECTIVE_TRIAL_COUNT; i++) {
                 if (consecutiveFailures >= SKIP_THRESHOLD) {
                     console.log(`\n   ⚠️  ${SKIP_THRESHOLD}回連続失敗のため残りをTimeOutとします。`);
-                    for (let k = i; k <= TRIAL_COUNT; k++) {
+                    for (let k = i; k <= EFFECTIVE_TRIAL_COUNT; k++) {
                         const skipFields = [
                             conditionName,
                             target.name,
@@ -308,7 +577,9 @@ const createPrStatusState = (url) => ({
                             'TimeOut',
                             0,
                             'FALSE',
-                            ...Array(14).fill('')
+                            ...Array(14).fill(''),
+                            SCENARIO,
+                            ...Array(8).fill('')
                         ];
                         fs.appendFileSync(OUTPUT_FILE, skipFields.map(toCsvValue).join(',') + '\n');
                     }
@@ -322,7 +593,9 @@ const createPrStatusState = (url) => ({
                 currentTrial = {
                     prUrls,
                     prStates: prUrls.map((url) => createPrState(url)),
-                    prStatus: prUrls.map((url) => createPrStatusState(url))
+                    prStatus: prUrls.map((url) => createPrStatusState(url)),
+                    clickedAt: null,
+                    attackMonitor: createAttackMonitorState()
                 };
 
                 // Prerender target logging state
@@ -331,11 +604,11 @@ const createPrStatusState = (url) => ({
                 const session = await page.target().createCDPSession();
                 await session.send('Network.enable');
                 // Clear caches/cookies each trial so transfer size reflects actual fetch
-                await session.send('Network.clearBrowserCache').catch(() => {});
-                await session.send('Network.clearBrowserCookies').catch(() => {});
-                await session.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => {});
-                await session.send('Preload.enable').catch(() => {});
-                await session.send('Runtime.runIfWaitingForDebugger').catch(() => {});
+                await session.send('Network.clearBrowserCache').catch(() => { });
+                await session.send('Network.clearBrowserCookies').catch(() => { });
+                await session.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => { });
+                await session.send('Preload.enable').catch(() => { });
+                await session.send('Runtime.runIfWaitingForDebugger').catch(() => { });
                 // Also watch network on top-level page (in case prerender requests leak here)
                 // Top-level page: still attach with URL-based fallback to catch leaks, but prerender sessions are keyed by session.
                 const cleanupTopNetwork = statusOnly ? null : attachNetworkListenersForSession(session);
@@ -386,6 +659,8 @@ const createPrStatusState = (url) => ({
 
                             await new Promise((r) => setTimeout(r, WAIT_TIME));
 
+                            // cancel_delay シナリオでは depth 実クリック時刻を主指標として保存
+                            currentTrial.clickedAt = Date.now();
                             await Promise.all([
                                 page.waitForNavigation({ waitUntil: 'load', timeout: TRIAL_TIMEOUT_MS }),
                                 page.click(target.id)
@@ -450,15 +725,15 @@ const createPrStatusState = (url) => ({
                         return { status: 'none', detect: 'NoEvent', note: 'no prerender seen' };
                     })();
 
-                        const prFields = currentTrial.prStates.flatMap((pr) => {
-                            const duration = pr.startTime && pr.endTime ? pr.endTime - pr.startTime : null;
-                            const transferKB =
-                                pr.started && pr.bytes !== null && pr.bytes !== undefined
-                                    ? (pr.bytes / 1024).toFixed(2)
-                                    : null;
-                            return [
-                                pr.url,
-                                pr.started,
+                    const prFields = currentTrial.prStates.flatMap((pr) => {
+                        const duration = pr.startTime && pr.endTime ? pr.endTime - pr.startTime : null;
+                        const transferKB =
+                            pr.started && pr.bytes !== null && pr.bytes !== undefined
+                                ? (pr.bytes / 1024).toFixed(2)
+                                : null;
+                        return [
+                            pr.url,
+                            pr.started,
                             pr.result,
                             pr.httpStatus,
                             pr.error,
@@ -466,6 +741,8 @@ const createPrStatusState = (url) => ({
                             transferKB !== null ? transferKB : ''
                         ];
                     });
+
+                    const attackFields = toAttackCsvFields(currentTrial);
 
                     const csvLine = [
                         conditionName,
@@ -475,7 +752,8 @@ const createPrStatusState = (url) => ({
                         metrics.fcp.toFixed(2),
                         (metrics.size / 1024 / 1024).toFixed(2),
                         overall.status === 'success',
-                        ...prFields
+                        ...prFields,
+                        ...attackFields
                     ]
                         .map(toCsvValue)
                         .join(',') + '\n';
@@ -528,6 +806,8 @@ const createPrStatusState = (url) => ({
                         ];
                     });
 
+                    const attackFields = toAttackCsvFields(currentTrial);
+
                     const errorFields = [
                         conditionName,
                         target.name,
@@ -536,7 +816,8 @@ const createPrStatusState = (url) => ({
                         'TimeOut',
                         0,
                         false,
-                        ...prFields
+                        ...prFields,
+                        ...attackFields
                     ];
                     fs.appendFileSync(OUTPUT_FILE, errorFields.map(toCsvValue).join(',') + '\n');
                 } finally {
@@ -554,5 +835,7 @@ const createPrStatusState = (url) => ({
     console.log(`\n=== 全計測終了 ===`);
     browserSession.off('Target.attachedToTarget', handleAttachedToTarget);
     browserSession.off('Target.detachedFromTarget', handleDetachedFromTarget);
+    attackSessionCleanupMap.forEach((cleanup) => cleanup && cleanup());
+    attackSessionCleanupMap.clear();
     await browser.close();
 })();
