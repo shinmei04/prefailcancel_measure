@@ -20,6 +20,11 @@ const SCENARIO = (process.env.SCENARIO || 'default').toLowerCase(); // default |
 const CLICK_SELECTOR_DEPTH = process.env.CLICK_SELECTOR_DEPTH || '#link-medium';
 const ATTACK_URL_PREFIX = 'https://attack.lab-ish.com/';
 const ATTACK_ORIGIN = new URL(ATTACK_URL_PREFIX).origin;
+const DEBUG_TIMELINE = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.DEBUG_TIMELINE || '').toLowerCase()
+);
+const DEBUG_TIMELINE_FILE = 'timeline_debug.jsonl';
+const IS_CANCEL_DELAY_SCENARIO = SCENARIO === 'cancel_delay';
 
 const parsePositiveInt = (raw) => {
     const value = Number.parseInt(raw || '', 10);
@@ -123,7 +128,23 @@ const createAttackMonitorState = () => ({
     events: []
 });
 
-const PREFAIL_TIMELINE_HEADERS = [
+const CORE_CSV_HEADERS = [
+    'Condition',
+    'Page',
+    'Trial_No',
+    'LCP_ms',
+    'FCP_ms',
+    'Transfer_MB',
+    'Prerendered',
+    'PR_Target1_URL',
+    'PR_T1_Result',
+    'PR_T1_Transfer_KB',
+    'PR_Target2_URL',
+    'PR_T2_Result',
+    'PR_T2_Transfer_KB'
+];
+
+const PREFAIL_CSV_HEADERS = [
     'Prefail_Click_ms',
     'Prefail_First_PR_Attach_ms',
     'Prefail_Last_PR_Detach_ms',
@@ -138,10 +159,26 @@ const PREFAIL_TIMELINE_HEADERS = [
     'Prefail_Normal_Nav_End_ms',
     'Prefail_PR_Normal_Overlap_ms',
     'Prefail_PR_Event_Count',
-    'Prefail_Normal_Event_Count',
-    'Prefail_Timeline_JSON'
+    'Prefail_Normal_Event_Count'
 ];
-const PREFAIL_FIELD_COUNT = PREFAIL_TIMELINE_HEADERS.length;
+
+const ATTACK_CSV_HEADERS = [
+    'Scenario',
+    'Clicked_At',
+    'Cancel_Observation_Started_At',
+    'PR_Attack_Stopped_At',
+    'PR_Attack_Stop_Reason',
+    'PR_Attack_Canceled',
+    'PR_Attack_Result',
+    'PR_Attack_Error',
+    'PR_Attack_CancelDelay_ms',
+    'PR_Attack_Transfer_KB',
+    'PR_Attack_PostClick_DataEvents',
+    'PR_Attack_PostClick_Data_KB',
+    'PR_Attack_Failure_Class'
+];
+
+const ATTACK_FIELD_COUNT = ATTACK_CSV_HEADERS.length;
 
 const createPrefailTimelineState = () => ({
     clickAt: null,
@@ -315,8 +352,7 @@ const buildPrefailTimelineSummary = (trial) => {
         normalNavEndMs: '',
         prNormalOverlapMs: '',
         prEventCount: '',
-        normalEventCount: '',
-        timelineJson: ''
+        normalEventCount: ''
     };
     if (!trial || !trial.prefailTimeline) return empty;
 
@@ -345,7 +381,8 @@ const buildPrefailTimelineSummary = (trial) => {
         firstPrRequestMs: relTime(trial, minTime(prRequests.map((req) => req.requestAt))),
         lastPrEventMs: relTime(trial, lastPrObservedAt),
         lastPrEndMs: relTime(trial, maxTime(prRequests.map((req) => req.endAt))),
-        postClickPrTailMs: isFiniteTime(clickAt) && isFiniteTime(lastPrIntervalEndAt) ? lastPrIntervalEndAt - clickAt : '',
+        postClickPrTailMs:
+            isFiniteTime(clickAt) && isFiniteTime(lastPrIntervalEndAt) ? lastPrIntervalEndAt - clickAt : '',
         postClickPrActiveMs: isFiniteTime(clickAt) ? getUnionDuration(prIntervals) : '',
         postClickPrTransferKB: isFiniteTime(clickAt) ? (postClickBytes / 1024).toFixed(2) : '',
         openPrRequestCount: prRequests.filter((req) => req.requestAt && !req.endAt).length,
@@ -353,8 +390,7 @@ const buildPrefailTimelineSummary = (trial) => {
         normalNavEndMs: relTime(trial, normalEndAt),
         prNormalOverlapMs: isFiniteTime(clickAt) ? getOverlapDuration(prIntervals, normalIntervals) : '',
         prEventCount: events.filter((evt) => evt.category === 'prerender').length,
-        normalEventCount: events.filter((evt) => evt.category === 'normal').length,
-        timelineJson: events.length > 0 ? JSON.stringify(events) : ''
+        normalEventCount: events.filter((evt) => evt.category === 'normal').length
     };
 };
 
@@ -375,8 +411,7 @@ const toPrefailCsvFields = (trial) => {
         summary.normalNavEndMs,
         summary.prNormalOverlapMs,
         summary.prEventCount,
-        summary.normalEventCount,
-        summary.timelineJson
+        summary.normalEventCount
     ];
 };
 
@@ -395,9 +430,7 @@ const buildAttackSummary = (trial) => {
             transferKB: '',
             postClickDataEvents: '',
             postClickDataKB: '',
-            failureClass: 'no_attack_monitor',
-            eventsJson: '',
-            timelineJson: ''
+            failureClass: 'no_attack_monitor'
         };
     }
 
@@ -405,7 +438,8 @@ const buildAttackSummary = (trial) => {
     const monitor = trial.attackMonitor;
     const requests = Array.from(monitor.requests.values());
     const filterAfterClick = (ts) => (clickedAt ? ts >= clickedAt : true);
-    const byTs = (a, b, key) => (a[key] || Number.MAX_SAFE_INTEGER) - (b[key] || Number.MAX_SAFE_INTEGER);
+    const byTs = (a, b, key) =>
+        (a[key] || Number.MAX_SAFE_INTEGER) - (b[key] || Number.MAX_SAFE_INTEGER);
 
     // 停止時刻の優先順位: canceled loadingFailed > loadingFinished > prerender target detach
     const canceledCandidates = requests
@@ -453,19 +487,8 @@ const buildAttackSummary = (trial) => {
     const cancelDelay = clickedAt && stoppedAt ? stoppedAt - clickedAt : '';
     const transferBytes = requests.reduce((sum, r) => sum + (r.bytes || 0), 0);
     const transferKB = requests.length > 0 ? (transferBytes / 1024).toFixed(2) : '';
-    const postClickDataKB = monitor.postClickDataEvents > 0 ? (monitor.postClickDataBytes / 1024).toFixed(2) : '';
-
-    const timelineEvents = monitor.events
-        .slice()
-        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
-        .map((evt) => ({
-            t: evt.timestamp,
-            event: evt.event_type,
-            requestId: evt.requestId || null,
-            canceled: evt.canceled,
-            bytes: evt.bytes,
-            url: evt.url || null
-        }));
+    const postClickDataKB =
+        monitor.postClickDataEvents > 0 ? (monitor.postClickDataBytes / 1024).toFixed(2) : '';
 
     const failureClass = (() => {
         if (!clickedAt) return 'implementation_click_not_detected';
@@ -477,8 +500,6 @@ const buildAttackSummary = (trial) => {
         if (result === 'detached') return 'detached_without_network_stop';
         return `unknown_${result}`;
     })();
-
-    const eventsJson = monitor.events.length > 0 ? JSON.stringify(monitor.events) : '';
 
     return {
         scenario: SCENARIO,
@@ -493,9 +514,7 @@ const buildAttackSummary = (trial) => {
         transferKB,
         postClickDataEvents: monitor.postClickDataEvents || '',
         postClickDataKB,
-        failureClass,
-        eventsJson,
-        timelineJson: timelineEvents.length > 0 ? JSON.stringify(timelineEvents) : ''
+        failureClass
     };
 };
 
@@ -515,17 +534,25 @@ const toAttackCsvFields = (trial) => {
         summary.transferKB,
         summary.postClickDataEvents,
         summary.postClickDataKB,
-        summary.failureClass,
-        summary.eventsJson,
-        summary.timelineJson
+        summary.failureClass
     ];
 };
 
-const ATTACK_FIELD_COUNT = toAttackCsvFields(null).length;
-
 const printTrialTimeline = (trial, trialNo, targetName) => {
     const summary = buildAttackSummary(trial);
-    const timeline = summary.timelineJson ? JSON.parse(summary.timelineJson) : [];
+    const timeline = trial && trial.attackMonitor
+        ? trial.attackMonitor.events
+            .slice()
+            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+            .map((evt) => ({
+                t: evt.timestamp,
+                event: evt.event_type,
+                requestId: evt.requestId || null,
+                canceled: evt.canceled,
+                bytes: evt.bytes,
+                url: evt.url || null
+            }))
+        : [];
     const rows = timeline.map((evt) => ({
         time: evt.t,
         rel_from_click_ms: summary.clickedAt ? evt.t - summary.clickedAt : '',
@@ -547,47 +574,234 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
     }
 };
 
+const getCsvHeaders = () => [
+    ...CORE_CSV_HEADERS,
+    ...PREFAIL_CSV_HEADERS,
+    ...(IS_CANCEL_DELAY_SCENARIO ? ATTACK_CSV_HEADERS : [])
+];
+
+const getPrTransferKB = (pr) => {
+    if (!pr || !pr.started || pr.bytes === null || pr.bytes === undefined) return '';
+    return (pr.bytes / 1024).toFixed(2);
+};
+
+const toPrSummaryCsvFields = (prStates = []) => [0, 1].flatMap((idx) => {
+    const pr = prStates[idx];
+    if (!pr) return ['', '', ''];
+
+    return [
+        pr.url,
+        pr.result,
+        getPrTransferKB(pr)
+    ];
+});
+
+const finalizePendingPrStates = (trial, statusOnly) => {
+    if (!trial || statusOnly) return;
+
+    trial.prStates.forEach((pr) => {
+        if (pr.result !== 'pending') return;
+
+        pr.result = 'failed';
+        pr.endTime = pr.endTime || Date.now();
+    });
+};
+
+const inferOverallPrerenderStatus = (trial) => {
+    const st = trial.prStatus;
+    const hasSuccess = st.some((s) => s.status === 'success');
+    if (hasSuccess) {
+        return {
+            status: 'success',
+            detect: 'Preload.prerenderStatusUpdated',
+            note: 'Activated'
+        };
+    }
+
+    const canceled = st.find((s) => s.status === 'canceled');
+    if (canceled) {
+        return {
+            status: 'canceled',
+            detect: canceled.detectSource || 'Target.detach',
+            note: canceled.note || ''
+        };
+    }
+
+    const failed = st.find((s) => s.status === 'failed');
+    if (failed) {
+        return {
+            status: 'failed',
+            detect: failed.detectSource || 'unknown',
+            note: failed.note || ''
+        };
+    }
+
+    const anyReq = trial.prStates.some((pr) => pr.started);
+    if (anyReq) {
+        return {
+            status: 'unknown',
+            detect: 'NetworkOnly',
+            note: 'no Preload event'
+        };
+    }
+
+    return {
+        status: 'none',
+        detect: 'NoEvent',
+        note: 'no prerender seen'
+    };
+};
+
+const toAttackCsvFieldsForRow = (trial, skipped = false) => {
+    if (!IS_CANCEL_DELAY_SCENARIO) return [];
+    if (skipped) return [SCENARIO, ...Array(ATTACK_FIELD_COUNT - 1).fill('')];
+
+    return toAttackCsvFields(trial);
+};
+
+const toTrialCsvFields = ({
+    conditionName,
+    target,
+    trialNo,
+    metrics = null,
+    overall = null,
+    trial = null,
+    timeout = false,
+    skipped = false
+}) => [
+    conditionName,
+    target.name,
+    trialNo,
+    timeout ? 'TimeOut' : metrics.lcp.toFixed(2),
+    timeout ? 'TimeOut' : metrics.fcp.toFixed(2),
+    timeout ? 0 : (metrics.size / 1024 / 1024).toFixed(2),
+    timeout ? (skipped ? 'FALSE' : false) : overall.status === 'success',
+    ...toPrSummaryCsvFields(trial ? trial.prStates : []),
+    ...toPrefailCsvFields(trial),
+    ...toAttackCsvFieldsForRow(trial, skipped)
+];
+
+const appendCsvRow = (fields) => {
+    fs.appendFileSync(OUTPUT_FILE, fields.map(toCsvValue).join(',') + '\n');
+};
+
+const toRelativeAttackEvent = (trial, event) => {
+    const result = {
+        t: relTime(trial, event.timestamp),
+        event: event.event_type
+    };
+
+    [
+        'requestId',
+        'sessionId',
+        'url',
+        'resourceType',
+        'canceled',
+        'bytes',
+        'errorText'
+    ].forEach((key) => {
+        if (event[key] !== undefined && event[key] !== null) {
+            result[key] = event[key];
+        }
+    });
+
+    if (isFiniteTime(event.clicked_at)) {
+        result.clicked_ms = relTime(trial, event.clicked_at);
+    }
+
+    if (isFiniteTime(trial.clickedAt) && isFiniteTime(event.timestamp)) {
+        result.rel_click_ms = event.timestamp - trial.clickedAt;
+    }
+
+    return result;
+};
+
+const buildAttackDebugTimeline = (trial) => {
+    if (!trial || !trial.attackMonitor) return [];
+
+    return trial.attackMonitor.events
+        .slice()
+        .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+        .map((evt) => ({
+            t: relTime(trial, evt.timestamp),
+            event: evt.event_type,
+            requestId: evt.requestId || null,
+            canceled: evt.canceled,
+            bytes: evt.bytes,
+            url: evt.url || null
+        }));
+};
+
+const writeTimelineDebugRecord = ({
+    conditionName,
+    target,
+    trialNo,
+    trial,
+    outcome,
+    errorMessage = ''
+}) => {
+    if (!DEBUG_TIMELINE || !trial) return;
+
+    const prefailSummary = buildPrefailTimelineSummary(trial);
+    const attackSummary = buildAttackSummary(trial);
+    const record = {
+        condition: conditionName,
+        page: target.name,
+        trial_no: trialNo,
+        scenario: SCENARIO,
+        outcome,
+        error: errorMessage,
+        click_ms: prefailSummary.clickMs,
+        prefail_summary: {
+            first_pr_attach_ms: prefailSummary.firstPrAttachMs,
+            last_pr_detach_ms: prefailSummary.lastPrDetachMs,
+            first_pr_request_ms: prefailSummary.firstPrRequestMs,
+            last_pr_event_ms: prefailSummary.lastPrEventMs,
+            last_pr_end_ms: prefailSummary.lastPrEndMs,
+            post_click_pr_tail_ms: prefailSummary.postClickPrTailMs,
+            post_click_pr_active_ms: prefailSummary.postClickPrActiveMs,
+            post_click_pr_transfer_kb: prefailSummary.postClickPrTransferKB,
+            open_pr_request_count: prefailSummary.openPrRequestCount,
+            normal_nav_start_ms: prefailSummary.normalNavStartMs,
+            normal_nav_end_ms: prefailSummary.normalNavEndMs,
+            pr_normal_overlap_ms: prefailSummary.prNormalOverlapMs,
+            pr_event_count: prefailSummary.prEventCount,
+            normal_event_count: prefailSummary.normalEventCount
+        },
+        prefail_timeline: trial.prefailTimeline ? trial.prefailTimeline.events : []
+    };
+
+    if (trial.attackMonitor) {
+        record.attack_summary = {
+            clicked_ms: relTime(trial, attackSummary.clickedAt),
+            observation_started_ms: relTime(trial, attackSummary.observationStartedAt),
+            stopped_ms: relTime(trial, attackSummary.stoppedAt),
+            stop_reason: attackSummary.stopReason,
+            canceled: attackSummary.canceled,
+            result: attackSummary.result,
+            error: attackSummary.error,
+            cancel_delay_ms: attackSummary.cancelDelay,
+            transfer_kb: attackSummary.transferKB,
+            post_click_data_events: attackSummary.postClickDataEvents,
+            post_click_data_kb: attackSummary.postClickDataKB,
+            failure_class: attackSummary.failureClass
+        };
+        record.attack_events = trial.attackMonitor.events.map((event) =>
+            toRelativeAttackEvent(trial, event)
+        );
+        record.attack_timeline = buildAttackDebugTimeline(trial);
+    }
+
+    fs.appendFileSync(DEBUG_TIMELINE_FILE, JSON.stringify(record) + '\n');
+};
+
 (async () => {
-    const header = [
-        'Condition',
-        'Page',
-        'Trial_No',
-        'LCP_ms',
-        'FCP_ms',
-        'Transfer_MB',
-        'Prerendered',
-        'PR_Target1_URL',
-        'PR_T1_ReqStarted',
-        'PR_T1_Result',
-        'PR_T1_HTTPStatus',
-        'PR_T1_Error',
-        'PR_T1_Duration_ms',
-        'PR_T1_Transfer_KB',
-        'PR_Target2_URL',
-        'PR_T2_ReqStarted',
-        'PR_T2_Result',
-        'PR_T2_HTTPStatus',
-        'PR_T2_Error',
-        'PR_T2_Duration_ms',
-        'PR_T2_Transfer_KB',
-        'Scenario',
-        'Clicked_At',
-        'Cancel_Observation_Started_At',
-        'PR_Attack_Stopped_At',
-        'PR_Attack_Stop_Reason',
-        'PR_Attack_Canceled',
-        'PR_Attack_Result',
-        'PR_Attack_Error',
-        'PR_Attack_CancelDelay_ms',
-        'PR_Attack_Transfer_KB',
-        'PR_Attack_PostClick_DataEvents',
-        'PR_Attack_PostClick_Data_KB',
-        'PR_Attack_Failure_Class',
-        'PR_Attack_Events_JSON',
-        'PR_Attack_Timeline_JSON',
-        ...PREFAIL_TIMELINE_HEADERS
-    ].join(',');
+    const header = getCsvHeaders().join(',');
     fs.writeFileSync(OUTPUT_FILE, `${header}\n`);
+
+    if (DEBUG_TIMELINE) {
+        fs.writeFileSync(DEBUG_TIMELINE_FILE, '');
+    }
 
     const browser = await puppeteer.launch({
         headless: 'new',
@@ -603,7 +817,10 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
         waitForDebuggerOnStart: false
     });
 
-    console.log(`=== tc帯域制御 前提の通常遷移計測開始(Prerender裏通信ログ付): ${EFFECTIVE_TRIAL_COUNT}回計測 (Wait: ${WAIT_TIME}ms, Scenario: ${SCENARIO}) ===`);
+    console.log(
+        `=== tc帯域制御 前提の通常遷移計測開始(Prerender裏通信ログ付): ${EFFECTIVE_TRIAL_COUNT}回計測 ` +
+        `(Wait: ${WAIT_TIME}ms, Scenario: ${SCENARIO}) ===`
+    );
     console.log(`データは ${OUTPUT_FILE} に順次書き込まれます...\n`);
 
     let currentTrial = null;
@@ -1138,7 +1355,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             const requestId = params.requestId;
             const url = params.request?.url || '';
             const clickedAt = trialRef.clickedAt;
-            const shouldCancelNow = SCENARIO === 'cancel_delay' && !!clickedAt && isAttackUrl(url);
+            const shouldCancelNow = IS_CANCEL_DELAY_SCENARIO && !!clickedAt && isAttackUrl(url);
 
             if (shouldCancelNow) {
                 await session.send('Fetch.failRequest', {
@@ -1182,7 +1399,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
 
     const requestExplicitAttackCancel = async (trialRef) => {
         if (!trialRef || !trialRef.attackMonitor) return;
-        if (SCENARIO !== 'cancel_delay') return;
+        if (!IS_CANCEL_DELAY_SCENARIO) return;
 
         const monitor = trialRef.attackMonitor;
         if (!monitor.explicitCancelIssuedAt) {
@@ -1339,7 +1556,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
     browserSession.on('Target.detachedFromTarget', handleDetachedFromTarget);
 
     // cancel_delay は「depth を実クリック先」に固定し、attack 側 prerender 通信停止を観測
-    const runTargets = SCENARIO === 'cancel_delay' ? [CANCEL_DELAY_CLICK_TARGET] : targetsToMeasure;
+    const runTargets = IS_CANCEL_DELAY_SCENARIO ? [CANCEL_DELAY_CLICK_TARGET] : targetsToMeasure;
 
     for (const [conditionName] of Object.entries(NETWORK_CONDITIONS)) {
         for (const target of runTargets) {
@@ -1357,22 +1574,17 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             for (let i = 1; i <= EFFECTIVE_TRIAL_COUNT; i++) {
                 if (consecutiveFailures >= SKIP_THRESHOLD) {
                     console.log(`\n   ⚠️  ${SKIP_THRESHOLD}回連続失敗のため残りをTimeOutとします。`);
+
                     for (let k = i; k <= EFFECTIVE_TRIAL_COUNT; k++) {
-                        const skipFields = [
+                        appendCsvRow(toTrialCsvFields({
                             conditionName,
-                            target.name,
-                            k,
-                            'TimeOut',
-                            'TimeOut',
-                            0,
-                            'FALSE',
-                            ...Array(14).fill(''),
-                            SCENARIO,
-                            ...Array(ATTACK_FIELD_COUNT - 1).fill(''),
-                            ...Array(PREFAIL_FIELD_COUNT).fill('')
-                        ];
-                        fs.appendFileSync(OUTPUT_FILE, skipFields.map(toCsvValue).join(',') + '\n');
+                            target,
+                            trialNo: k,
+                            timeout: true,
+                            skipped: true
+                        }));
                     }
+
                     break;
                 }
 
@@ -1401,7 +1613,8 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                 await session.send('Preload.enable').catch(() => { });
                 await session.send('Runtime.runIfWaitingForDebugger').catch(() => { });
                 // Also watch network on top-level page (in case prerender requests leak here)
-                // Top-level page: still attach with URL-based fallback to catch leaks, but prerender sessions are keyed by session.
+                // Top-level page: still attach with URL-based fallback to catch leaks.
+                // Prerender sessions are keyed by session.
                 const cleanupTopNetwork = statusOnly ? null : attachNetworkListenersForSession(session);
                 const cleanupNormalTimeline = attachNormalNavigationTimelineListeners(session, currentTrial);
 
@@ -1536,68 +1749,27 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
 
                     clearTimeout(timeoutId);
 
-                    // finalize pending PR states
-                    if (!statusOnly) {
-                        currentTrial.prStates.forEach((pr) => {
-                            if (pr.result === 'pending') {
-                                pr.result = 'failed';
-                                pr.endTime = pr.endTime || Date.now();
-                            }
-                        });
-                    }
+                    finalizePendingPrStates(currentTrial, statusOnly);
 
-                    // infer overall prerender status
-                    const overall = (() => {
-                        const st = currentTrial.prStatus;
-                        const hasSuccess = st.some((s) => s.status === 'success');
-                        if (hasSuccess) return { status: 'success', detect: 'Preload.prerenderStatusUpdated', note: 'Activated' };
-                        const canceled = st.find((s) => s.status === 'canceled');
-                        if (canceled) return { status: 'canceled', detect: canceled.detectSource || 'Target.detach', note: canceled.note || '' };
-                        const failed = st.find((s) => s.status === 'failed');
-                        if (failed) return { status: 'failed', detect: failed.detectSource || 'unknown', note: failed.note || '' };
-                        const anyReq = currentTrial.prStates.some((pr) => pr.started);
-                        if (anyReq) return { status: 'unknown', detect: 'NetworkOnly', note: 'no Preload event' };
-                        return { status: 'none', detect: 'NoEvent', note: 'no prerender seen' };
-                    })();
+                    const overall = inferOverallPrerenderStatus(currentTrial);
+                    appendCsvRow(toTrialCsvFields({
+                        conditionName,
+                        target,
+                        trialNo: i,
+                        metrics,
+                        overall,
+                        trial: currentTrial
+                    }));
 
-                    const prFields = currentTrial.prStates.flatMap((pr) => {
-                        const duration = pr.startTime && pr.endTime ? pr.endTime - pr.startTime : null;
-                        const transferKB =
-                            pr.started && pr.bytes !== null && pr.bytes !== undefined
-                                ? (pr.bytes / 1024).toFixed(2)
-                                : null;
-                        return [
-                            pr.url,
-                            pr.started,
-                            pr.result,
-                            pr.httpStatus,
-                            pr.error,
-                            duration !== null ? duration : '',
-                            transferKB !== null ? transferKB : ''
-                        ];
+                    writeTimelineDebugRecord({
+                        conditionName,
+                        target,
+                        trialNo: i,
+                        trial: currentTrial,
+                        outcome: 'success'
                     });
 
-                    const attackFields = toAttackCsvFields(currentTrial);
-                    const prefailFields = toPrefailCsvFields(currentTrial);
-
-                    const csvLine = [
-                        conditionName,
-                        target.name,
-                        i,
-                        metrics.lcp.toFixed(2),
-                        metrics.fcp.toFixed(2),
-                        (metrics.size / 1024 / 1024).toFixed(2),
-                        overall.status === 'success',
-                        ...prFields,
-                        ...attackFields,
-                        ...prefailFields
-                    ]
-                        .map(toCsvValue)
-                        .join(',') + '\n';
-
-                    fs.appendFileSync(OUTPUT_FILE, csvLine);
-
-                    if (SCENARIO === 'cancel_delay' && i === TIMELINE_TRIAL_NO) {
+                    if (DEBUG_TIMELINE && IS_CANCEL_DELAY_SCENARIO && i === TIMELINE_TRIAL_NO) {
                         printTrialTimeline(currentTrial, i, target.name);
                     }
 
@@ -1608,63 +1780,28 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                     consecutiveFailures++;
                     console.error(`\n[Error] Trial ${i}: ${e.message}`);
 
-                    // finalize pending PR states
-                    if (!statusOnly) {
-                        currentTrial.prStates.forEach((pr) => {
-                            if (pr.result === 'pending') {
-                                pr.result = 'failed';
-                                pr.endTime = pr.endTime || Date.now();
-                            }
-                        });
-                    }
-                    const overall = (() => {
-                        const st = currentTrial.prStatus;
-                        const hasSuccess = st.some((s) => s.status === 'success');
-                        if (hasSuccess) return { status: 'success', detect: 'Preload.prerenderStatusUpdated', note: 'Activated' };
-                        const canceled = st.find((s) => s.status === 'canceled');
-                        if (canceled) return { status: 'canceled', detect: canceled.detectSource || 'Target.detach', note: canceled.note || '' };
-                        const failed = st.find((s) => s.status === 'failed');
-                        if (failed) return { status: 'failed', detect: failed.detectSource || 'unknown', note: failed.note || '' };
-                        const anyReq = currentTrial.prStates.some((pr) => pr.started);
-                        if (anyReq) return { status: 'unknown', detect: 'NetworkOnly', note: 'no Preload event' };
-                        return { status: 'none', detect: 'NoEvent', note: 'no prerender seen' };
-                    })();
+                    finalizePendingPrStates(currentTrial, statusOnly);
 
-                    const prFields = currentTrial.prStates.flatMap((pr) => {
-                        const duration = pr.startTime && pr.endTime ? pr.endTime - pr.startTime : null;
-                        const transferKB =
-                            pr.started && pr.bytes !== null && pr.bytes !== undefined
-                                ? (pr.bytes / 1024).toFixed(2)
-                                : null;
-                        return [
-                            pr.url,
-                            pr.started,
-                            pr.result,
-                            pr.httpStatus,
-                            pr.error,
-                            duration !== null ? duration : '',
-                            transferKB !== null ? transferKB : ''
-                        ];
+                    const overall = inferOverallPrerenderStatus(currentTrial);
+                    appendCsvRow(toTrialCsvFields({
+                        conditionName,
+                        target,
+                        trialNo: i,
+                        overall,
+                        trial: currentTrial,
+                        timeout: true
+                    }));
+
+                    writeTimelineDebugRecord({
+                        conditionName,
+                        target,
+                        trialNo: i,
+                        trial: currentTrial,
+                        outcome: 'error',
+                        errorMessage: e.message
                     });
 
-                    const attackFields = toAttackCsvFields(currentTrial);
-                    const prefailFields = toPrefailCsvFields(currentTrial);
-
-                    const errorFields = [
-                        conditionName,
-                        target.name,
-                        i,
-                        'TimeOut',
-                        'TimeOut',
-                        0,
-                        false,
-                        ...prFields,
-                        ...attackFields,
-                        ...prefailFields
-                    ];
-                    fs.appendFileSync(OUTPUT_FILE, errorFields.map(toCsvValue).join(',') + '\n');
-
-                    if (SCENARIO === 'cancel_delay' && i === TIMELINE_TRIAL_NO) {
+                    if (DEBUG_TIMELINE && IS_CANCEL_DELAY_SCENARIO && i === TIMELINE_TRIAL_NO) {
                         printTrialTimeline(currentTrial, i, target.name);
                     }
                 } finally {
