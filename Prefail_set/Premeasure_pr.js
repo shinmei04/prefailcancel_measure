@@ -123,6 +123,263 @@ const createAttackMonitorState = () => ({
     events: []
 });
 
+const PREFAIL_TIMELINE_HEADERS = [
+    'Prefail_Click_ms',
+    'Prefail_First_PR_Attach_ms',
+    'Prefail_Last_PR_Detach_ms',
+    'Prefail_First_PR_Request_ms',
+    'Prefail_Last_PR_Event_ms',
+    'Prefail_Last_PR_End_ms',
+    'Prefail_PostClick_PR_Tail_ms',
+    'Prefail_PostClick_PR_Active_ms',
+    'Prefail_PostClick_PR_Transfer_KB',
+    'Prefail_Open_PR_Request_Count',
+    'Prefail_Normal_Nav_Start_ms',
+    'Prefail_Normal_Nav_End_ms',
+    'Prefail_PR_Normal_Overlap_ms',
+    'Prefail_PR_Event_Count',
+    'Prefail_Normal_Event_Count',
+    'Prefail_Timeline_JSON'
+];
+const PREFAIL_FIELD_COUNT = PREFAIL_TIMELINE_HEADERS.length;
+
+const createPrefailTimelineState = () => ({
+    clickAt: null,
+    prRequests: new Map(), // key: sessionId:requestId
+    normalRequests: new Map(), // key: sessionId:requestId
+    prerenderTargets: new Map(), // sessionId -> { attachAt, detachAt, ... }
+    events: []
+});
+
+const isFiniteTime = (value) => typeof value === 'number' && Number.isFinite(value);
+
+const minTime = (values) => {
+    const filtered = values.filter(isFiniteTime);
+    return filtered.length > 0 ? Math.min(...filtered) : null;
+};
+
+const maxTime = (values) => {
+    const filtered = values.filter(isFiniteTime);
+    return filtered.length > 0 ? Math.max(...filtered) : null;
+};
+
+const relTime = (trial, timestamp) => {
+    if (!trial || !isFiniteTime(trial.trialStart) || !isFiniteTime(timestamp)) return '';
+    return timestamp - trial.trialStart;
+};
+
+const pushPrefailTimelineEvent = (trial, payload) => {
+    if (!trial || !trial.prefailTimeline || !isFiniteTime(trial.trialStart)) return;
+    const timestamp = payload.timestamp || Date.now();
+    const event = {
+        t: relTime(trial, timestamp),
+        event: payload.event,
+        category: payload.category
+    };
+    if (isFiniteTime(trial.clickedAt)) {
+        event.rel_click_ms = timestamp - trial.clickedAt;
+    }
+    [
+        'sessionId',
+        'requestId',
+        'prIndex',
+        'sessionType',
+        'url',
+        'resourceType',
+        'status',
+        'prerenderStatus',
+        'httpStatus',
+        'bytes',
+        'canceled',
+        'errorText'
+    ].forEach((key) => {
+        if (payload[key] !== undefined && payload[key] !== null) {
+            event[key] = payload[key];
+        }
+    });
+    trial.prefailTimeline.events.push(event);
+};
+
+const getTimelineRequestKey = (sessionId, requestId) => `${sessionId}:${requestId}`;
+
+const ensureTimelineRequest = (trial, mapName, fields) => {
+    if (!trial || !trial.prefailTimeline || !fields.sessionId || !fields.requestId) return null;
+    const requests = trial.prefailTimeline[mapName];
+    const key = getTimelineRequestKey(fields.sessionId, fields.requestId);
+    if (!requests.has(key)) {
+        requests.set(key, {
+            sessionId: fields.sessionId,
+            requestId: fields.requestId,
+            prIndex: fields.prIndex,
+            sessionType: fields.sessionType || '',
+            url: fields.url || '',
+            resourceType: fields.resourceType || '',
+            requestAt: null,
+            responseAt: null,
+            lastDataAt: null,
+            finishAt: null,
+            failAt: null,
+            endAt: null,
+            lastEventAt: null,
+            bytes: 0,
+            postClickBytes: 0,
+            dataEvents: 0,
+            httpStatus: null,
+            canceled: false,
+            errorText: null
+        });
+    }
+    const req = requests.get(key);
+    ['prIndex', 'sessionType', 'url', 'resourceType'].forEach((name) => {
+        if (fields[name] !== undefined && fields[name] !== null && fields[name] !== '') {
+            req[name] = fields[name];
+        }
+    });
+    return req;
+};
+
+const getTimelineRequest = (trial, mapName, sessionId, requestId) => {
+    if (!trial || !trial.prefailTimeline || !sessionId || !requestId) return null;
+    return trial.prefailTimeline[mapName].get(getTimelineRequestKey(sessionId, requestId)) || null;
+};
+
+const getObservedRequestEndAt = (req) =>
+    req.endAt || req.lastDataAt || req.responseAt || req.requestAt || null;
+
+const getIntervalsAfterClick = (requests, clickAt) => {
+    if (!isFiniteTime(clickAt)) return [];
+    return requests
+        .map((req) => {
+            const start = req.requestAt;
+            const end = getObservedRequestEndAt(req);
+            if (!isFiniteTime(start) || !isFiniteTime(end) || end < clickAt) return null;
+            const clippedStart = Math.max(start, clickAt);
+            if (end <= clippedStart) return null;
+            return { start: clippedStart, end };
+        })
+        .filter(Boolean);
+};
+
+const mergeIntervals = (intervals) => {
+    const sorted = intervals
+        .filter((item) => isFiniteTime(item.start) && isFiniteTime(item.end) && item.end > item.start)
+        .slice()
+        .sort((a, b) => a.start - b.start);
+    const merged = [];
+    sorted.forEach((item) => {
+        const last = merged[merged.length - 1];
+        if (!last || item.start > last.end) {
+            merged.push({ start: item.start, end: item.end });
+            return;
+        }
+        last.end = Math.max(last.end, item.end);
+    });
+    return merged;
+};
+
+const getUnionDuration = (intervals) =>
+    mergeIntervals(intervals).reduce((sum, item) => sum + item.end - item.start, 0);
+
+const getOverlapDuration = (leftIntervals, rightIntervals) => {
+    const left = mergeIntervals(leftIntervals);
+    const right = mergeIntervals(rightIntervals);
+    let i = 0;
+    let j = 0;
+    let overlap = 0;
+    while (i < left.length && j < right.length) {
+        const start = Math.max(left[i].start, right[j].start);
+        const end = Math.min(left[i].end, right[j].end);
+        if (end > start) overlap += end - start;
+        if (left[i].end < right[j].end) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    return overlap;
+};
+
+const buildPrefailTimelineSummary = (trial) => {
+    const empty = {
+        clickMs: '',
+        firstPrAttachMs: '',
+        lastPrDetachMs: '',
+        firstPrRequestMs: '',
+        lastPrEventMs: '',
+        lastPrEndMs: '',
+        postClickPrTailMs: '',
+        postClickPrActiveMs: '',
+        postClickPrTransferKB: '',
+        openPrRequestCount: '',
+        normalNavStartMs: '',
+        normalNavEndMs: '',
+        prNormalOverlapMs: '',
+        prEventCount: '',
+        normalEventCount: '',
+        timelineJson: ''
+    };
+    if (!trial || !trial.prefailTimeline) return empty;
+
+    const timeline = trial.prefailTimeline;
+    const clickAt = timeline.clickAt || trial.clickedAt || null;
+    const prRequests = Array.from(timeline.prRequests.values());
+    const normalRequests = Array.from(timeline.normalRequests.values());
+    const prTargets = Array.from(timeline.prerenderTargets.values());
+    const prIntervals = getIntervalsAfterClick(prRequests, clickAt);
+    const normalIntervals = getIntervalsAfterClick(normalRequests, clickAt);
+    const lastPrObservedAt = maxTime([
+        ...prRequests.map((req) => req.lastEventAt),
+        ...prTargets.map((target) => target.attachAt),
+        ...prTargets.map((target) => target.detachAt)
+    ]);
+    const lastPrIntervalEndAt = maxTime(prIntervals.map((item) => item.end));
+    const normalStartAt = minTime(normalIntervals.map((item) => item.start));
+    const normalEndAt = maxTime(normalIntervals.map((item) => item.end));
+    const postClickBytes = prRequests.reduce((sum, req) => sum + (req.postClickBytes || 0), 0);
+    const events = timeline.events.slice().sort((a, b) => (a.t || 0) - (b.t || 0));
+
+    return {
+        clickMs: relTime(trial, clickAt),
+        firstPrAttachMs: relTime(trial, minTime(prTargets.map((target) => target.attachAt))),
+        lastPrDetachMs: relTime(trial, maxTime(prTargets.map((target) => target.detachAt))),
+        firstPrRequestMs: relTime(trial, minTime(prRequests.map((req) => req.requestAt))),
+        lastPrEventMs: relTime(trial, lastPrObservedAt),
+        lastPrEndMs: relTime(trial, maxTime(prRequests.map((req) => req.endAt))),
+        postClickPrTailMs: isFiniteTime(clickAt) && isFiniteTime(lastPrIntervalEndAt) ? lastPrIntervalEndAt - clickAt : '',
+        postClickPrActiveMs: isFiniteTime(clickAt) ? getUnionDuration(prIntervals) : '',
+        postClickPrTransferKB: isFiniteTime(clickAt) ? (postClickBytes / 1024).toFixed(2) : '',
+        openPrRequestCount: prRequests.filter((req) => req.requestAt && !req.endAt).length,
+        normalNavStartMs: relTime(trial, normalStartAt),
+        normalNavEndMs: relTime(trial, normalEndAt),
+        prNormalOverlapMs: isFiniteTime(clickAt) ? getOverlapDuration(prIntervals, normalIntervals) : '',
+        prEventCount: events.filter((evt) => evt.category === 'prerender').length,
+        normalEventCount: events.filter((evt) => evt.category === 'normal').length,
+        timelineJson: events.length > 0 ? JSON.stringify(events) : ''
+    };
+};
+
+const toPrefailCsvFields = (trial) => {
+    const summary = buildPrefailTimelineSummary(trial);
+    return [
+        summary.clickMs,
+        summary.firstPrAttachMs,
+        summary.lastPrDetachMs,
+        summary.firstPrRequestMs,
+        summary.lastPrEventMs,
+        summary.lastPrEndMs,
+        summary.postClickPrTailMs,
+        summary.postClickPrActiveMs,
+        summary.postClickPrTransferKB,
+        summary.openPrRequestCount,
+        summary.normalNavStartMs,
+        summary.normalNavEndMs,
+        summary.prNormalOverlapMs,
+        summary.prEventCount,
+        summary.normalEventCount,
+        summary.timelineJson
+    ];
+};
+
 const buildAttackSummary = (trial) => {
     if (!trial || !trial.attackMonitor) {
         return {
@@ -327,7 +584,8 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
         'PR_Attack_PostClick_Data_KB',
         'PR_Attack_Failure_Class',
         'PR_Attack_Events_JSON',
-        'PR_Attack_Timeline_JSON'
+        'PR_Attack_Timeline_JSON',
+        ...PREFAIL_TIMELINE_HEADERS
     ].join(',');
     fs.writeFileSync(OUTPUT_FILE, `${header}\n`);
 
@@ -393,6 +651,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
     const attachNetworkListenersForSession = (session, forcedPrIndex = null) => {
         const reqMap = new Map();
         sessionIdToReqMap.set(session.id(), { reqMap, prIndex: forcedPrIndex });
+        const getSessionType = () => (prerenderSessionIds.has(session.id()) ? 'prerender' : 'top-level');
 
         const handleRequestWillBeSent = (params) => {
             if (!currentTrial) return;
@@ -400,12 +659,37 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             const idx = forcedPrIndex !== null ? forcedPrIndex : findTargetIndex(url);
             if (idx === -1) return;
             const pr = currentTrial.prStates[idx];
+            const now = Date.now();
             if (!pr.started) {
                 pr.started = true;
-                pr.startTime = Date.now();
+                pr.startTime = now;
                 pr.result = 'pending';
             }
             reqMap.set(params.requestId, idx);
+
+            const timelineReq = ensureTimelineRequest(currentTrial, 'prRequests', {
+                sessionId: session.id(),
+                requestId: params.requestId,
+                prIndex: idx,
+                sessionType: getSessionType(),
+                url,
+                resourceType: params.type
+            });
+            if (timelineReq) {
+                timelineReq.requestAt = timelineReq.requestAt || now;
+                timelineReq.lastEventAt = now;
+            }
+            pushPrefailTimelineEvent(currentTrial, {
+                timestamp: now,
+                event: 'pr_request',
+                category: 'prerender',
+                sessionId: session.id(),
+                requestId: params.requestId,
+                prIndex: idx,
+                sessionType: getSessionType(),
+                url,
+                resourceType: params.type
+            });
         };
 
         const handleResponseReceived = (params) => {
@@ -418,6 +702,31 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             if (pr.httpStatus === null && params.response?.status) {
                 pr.httpStatus = params.response.status;
             }
+            const now = Date.now();
+            const url = params.response?.url || pr.url;
+            const timelineReq = ensureTimelineRequest(currentTrial, 'prRequests', {
+                sessionId: session.id(),
+                requestId: params.requestId,
+                prIndex: idx,
+                sessionType: getSessionType(),
+                url
+            });
+            if (timelineReq) {
+                timelineReq.responseAt = timelineReq.responseAt || now;
+                timelineReq.lastEventAt = now;
+                timelineReq.httpStatus = params.response?.status || timelineReq.httpStatus;
+            }
+            pushPrefailTimelineEvent(currentTrial, {
+                timestamp: now,
+                event: 'pr_response',
+                category: 'prerender',
+                sessionId: session.id(),
+                requestId: params.requestId,
+                prIndex: idx,
+                sessionType: getSessionType(),
+                url,
+                httpStatus: params.response?.status
+            });
         };
 
         const handleDataReceived = (params) => {
@@ -428,6 +737,30 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             if (idx === undefined) return;
             const pr = currentTrial.prStates[idx];
             pr.bytes += params.dataLength || 0;
+            const now = Date.now();
+            const timelineReq = getTimelineRequest(currentTrial, 'prRequests', session.id(), params.requestId);
+            if (timelineReq) {
+                const bytes = params.dataLength || 0;
+                timelineReq.bytes += bytes;
+                timelineReq.dataEvents += 1;
+                timelineReq.lastDataAt = now;
+                timelineReq.lastEventAt = now;
+                if (currentTrial.clickedAt && now >= currentTrial.clickedAt) {
+                    timelineReq.postClickBytes += bytes;
+                }
+                pushPrefailTimelineEvent(currentTrial, {
+                    timestamp: now,
+                    event: 'pr_data',
+                    category: 'prerender',
+                    sessionId: session.id(),
+                    requestId: params.requestId,
+                    prIndex: timelineReq.prIndex,
+                    sessionType: timelineReq.sessionType,
+                    url: timelineReq.url,
+                    resourceType: timelineReq.resourceType,
+                    bytes: timelineReq.bytes
+                });
+            }
         };
 
         const handleLoadingFinished = (params) => {
@@ -438,8 +771,29 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             if (idx === undefined) return;
             const pr = currentTrial.prStates[idx];
             pr.bytes = Math.max(pr.bytes, params.encodedDataLength || 0);
-            pr.endTime = Date.now();
+            const now = Date.now();
+            pr.endTime = now;
             pr.result = 'finished';
+            const timelineReq = getTimelineRequest(currentTrial, 'prRequests', session.id(), params.requestId);
+            if (timelineReq) {
+                timelineReq.bytes = Math.max(timelineReq.bytes, params.encodedDataLength || 0);
+                timelineReq.finishAt = now;
+                timelineReq.endAt = now;
+                timelineReq.lastEventAt = now;
+                pushPrefailTimelineEvent(currentTrial, {
+                    timestamp: now,
+                    event: 'pr_finish',
+                    category: 'prerender',
+                    sessionId: session.id(),
+                    requestId: params.requestId,
+                    prIndex: timelineReq.prIndex,
+                    sessionType: timelineReq.sessionType,
+                    url: timelineReq.url,
+                    resourceType: timelineReq.resourceType,
+                    bytes: timelineReq.bytes,
+                    canceled: false
+                });
+            }
         };
 
         const handleLoadingFailed = (params) => {
@@ -449,9 +803,32 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             const idx = data.reqMap.get(params.requestId);
             if (idx === undefined) return;
             const pr = currentTrial.prStates[idx];
-            pr.endTime = Date.now();
+            const now = Date.now();
+            pr.endTime = now;
             pr.result = params.canceled ? 'canceled' : 'failed';
             pr.error = params.errorText || null;
+            const timelineReq = getTimelineRequest(currentTrial, 'prRequests', session.id(), params.requestId);
+            if (timelineReq) {
+                timelineReq.failAt = now;
+                timelineReq.endAt = now;
+                timelineReq.lastEventAt = now;
+                timelineReq.canceled = !!params.canceled;
+                timelineReq.errorText = params.errorText || null;
+                pushPrefailTimelineEvent(currentTrial, {
+                    timestamp: now,
+                    event: params.canceled ? 'pr_cancel' : 'pr_fail',
+                    category: 'prerender',
+                    sessionId: session.id(),
+                    requestId: params.requestId,
+                    prIndex: timelineReq.prIndex,
+                    sessionType: timelineReq.sessionType,
+                    url: timelineReq.url,
+                    resourceType: timelineReq.resourceType,
+                    bytes: timelineReq.bytes,
+                    canceled: !!params.canceled,
+                    errorText: params.errorText || null
+                });
+            }
         };
 
         session.on('Network.requestWillBeSent', handleRequestWillBeSent);
@@ -467,6 +844,144 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
             session.off('Network.loadingFinished', handleLoadingFinished);
             session.off('Network.loadingFailed', handleLoadingFailed);
             sessionIdToReqMap.delete(session.id());
+        };
+    };
+
+    const attachNormalNavigationTimelineListeners = (session, trialRef) => {
+        const sessionId = session.id();
+        const isActiveTrial = () => currentTrial && currentTrial === trialRef && isFiniteTime(trialRef.clickedAt);
+
+        const handleRequestWillBeSent = (params) => {
+            if (!isActiveTrial()) return;
+            const now = Date.now();
+            if (now < trialRef.clickedAt) return;
+            const url = params.request?.url || '';
+            const req = ensureTimelineRequest(trialRef, 'normalRequests', {
+                sessionId,
+                requestId: params.requestId,
+                sessionType: 'top-level',
+                url,
+                resourceType: params.type
+            });
+            if (!req) return;
+            req.requestAt = req.requestAt || now;
+            req.lastEventAt = now;
+            pushPrefailTimelineEvent(trialRef, {
+                timestamp: now,
+                event: 'normal_request',
+                category: 'normal',
+                sessionId,
+                requestId: params.requestId,
+                sessionType: 'top-level',
+                url,
+                resourceType: params.type
+            });
+        };
+
+        const handleResponseReceived = (params) => {
+            if (!isActiveTrial()) return;
+            const req = getTimelineRequest(trialRef, 'normalRequests', sessionId, params.requestId);
+            if (!req) return;
+            const now = Date.now();
+            req.responseAt = req.responseAt || now;
+            req.lastEventAt = now;
+            req.httpStatus = params.response?.status || req.httpStatus;
+            pushPrefailTimelineEvent(trialRef, {
+                timestamp: now,
+                event: 'normal_response',
+                category: 'normal',
+                sessionId,
+                requestId: params.requestId,
+                sessionType: 'top-level',
+                url: params.response?.url || req.url,
+                resourceType: req.resourceType,
+                httpStatus: params.response?.status
+            });
+        };
+
+        const handleDataReceived = (params) => {
+            if (!isActiveTrial()) return;
+            const req = getTimelineRequest(trialRef, 'normalRequests', sessionId, params.requestId);
+            if (!req) return;
+            const now = Date.now();
+            const bytes = params.dataLength || 0;
+            req.bytes += bytes;
+            req.dataEvents += 1;
+            req.lastDataAt = now;
+            req.lastEventAt = now;
+            pushPrefailTimelineEvent(trialRef, {
+                timestamp: now,
+                event: 'normal_data',
+                category: 'normal',
+                sessionId,
+                requestId: params.requestId,
+                sessionType: 'top-level',
+                url: req.url,
+                resourceType: req.resourceType,
+                bytes: req.bytes
+            });
+        };
+
+        const handleLoadingFinished = (params) => {
+            if (!isActiveTrial()) return;
+            const req = getTimelineRequest(trialRef, 'normalRequests', sessionId, params.requestId);
+            if (!req) return;
+            const now = Date.now();
+            req.bytes = Math.max(req.bytes, params.encodedDataLength || 0);
+            req.finishAt = now;
+            req.endAt = now;
+            req.lastEventAt = now;
+            pushPrefailTimelineEvent(trialRef, {
+                timestamp: now,
+                event: 'normal_finish',
+                category: 'normal',
+                sessionId,
+                requestId: params.requestId,
+                sessionType: 'top-level',
+                url: req.url,
+                resourceType: req.resourceType,
+                bytes: req.bytes,
+                canceled: false
+            });
+        };
+
+        const handleLoadingFailed = (params) => {
+            if (!isActiveTrial()) return;
+            const req = getTimelineRequest(trialRef, 'normalRequests', sessionId, params.requestId);
+            if (!req) return;
+            const now = Date.now();
+            req.failAt = now;
+            req.endAt = now;
+            req.lastEventAt = now;
+            req.canceled = !!params.canceled;
+            req.errorText = params.errorText || null;
+            pushPrefailTimelineEvent(trialRef, {
+                timestamp: now,
+                event: params.canceled ? 'normal_cancel' : 'normal_fail',
+                category: 'normal',
+                sessionId,
+                requestId: params.requestId,
+                sessionType: 'top-level',
+                url: req.url,
+                resourceType: req.resourceType,
+                bytes: req.bytes,
+                canceled: !!params.canceled,
+                errorText: params.errorText || null
+            });
+        };
+
+        session.on('Network.requestWillBeSent', handleRequestWillBeSent);
+        session.on('Network.responseReceived', handleResponseReceived);
+        session.on('Network.dataReceived', handleDataReceived);
+        session.on('Network.loadingFinished', handleLoadingFinished);
+        session.on('Network.loadingFailed', handleLoadingFailed);
+
+        return () => {
+            session.off('Network.requestWillBeSent', handleRequestWillBeSent);
+            session.off('Network.responseReceived', handleResponseReceived);
+            session.off('Network.dataReceived', handleDataReceived);
+            session.off('Network.loadingFinished', handleLoadingFinished);
+            session.off('Network.loadingFailed', handleLoadingFailed);
         };
     };
 
@@ -684,9 +1199,24 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                 clicked_at: trialRef.clickedAt || null
             });
         }
+        pushPrefailTimelineEvent(trialRef, {
+            timestamp: monitor.explicitCancelIssuedAt,
+            event: 'explicit_cancel_requested',
+            category: 'prerender',
+            url: ATTACK_URL_PREFIX,
+            canceled: true
+        });
 
-        const stopTasks = Array.from(prerenderSessions.values()).map((prSession) =>
-            prSession.send('Page.stopLoading').catch(() => { })
+        const stopTasks = Array.from(prerenderSessions.entries()).map(([sessionId, prSession]) =>
+            prSession.send('Page.stopLoading').then(() => {
+                pushPrefailTimelineEvent(trialRef, {
+                    timestamp: Date.now(),
+                    event: 'pr_stop_loading_requested',
+                    category: 'prerender',
+                    sessionId,
+                    canceled: true
+                });
+            }).catch(() => { })
         );
         await Promise.all(stopTasks);
     };
@@ -699,6 +1229,25 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
         const targetUrl = params.targetInfo?.url || '';
         const prIndex = resolvePrIndexForTarget(targetUrl);
         prerenderSessionIds.add(params.sessionId);
+        if (currentTrial && currentTrial.prefailTimeline) {
+            const now = Date.now();
+            currentTrial.prefailTimeline.prerenderTargets.set(params.sessionId, {
+                sessionId: params.sessionId,
+                prIndex,
+                targetUrl,
+                attachAt: now,
+                detachAt: null
+            });
+            pushPrefailTimelineEvent(currentTrial, {
+                timestamp: now,
+                event: 'pr_target_attach',
+                category: 'prerender',
+                sessionId: params.sessionId,
+                prIndex,
+                sessionType: 'prerender',
+                url: targetUrl
+            });
+        }
         try {
             await session.send('Network.enable');
             await session.send('Network.setCacheDisabled', { cacheDisabled: true }).catch(() => { });
@@ -716,6 +1265,26 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
     };
 
     const handleDetachedFromTarget = (params) => {
+        if (currentTrial && currentTrial.prefailTimeline) {
+            const target = currentTrial.prefailTimeline.prerenderTargets.get(params.sessionId) || {
+                sessionId: params.sessionId,
+                prIndex: null,
+                targetUrl: params.targetInfo?.url || '',
+                attachAt: null,
+                detachAt: null
+            };
+            target.detachAt = Date.now();
+            currentTrial.prefailTimeline.prerenderTargets.set(params.sessionId, target);
+            pushPrefailTimelineEvent(currentTrial, {
+                timestamp: target.detachAt,
+                event: 'pr_target_detach',
+                category: 'prerender',
+                sessionId: params.sessionId,
+                prIndex: target.prIndex,
+                sessionType: 'prerender',
+                url: params.targetInfo?.url || target.targetUrl
+            });
+        }
         prerenderSessions.delete(params.sessionId);
         const shouldCaptureAttackDetach =
             !!(currentTrial && currentTrial.attackMonitor && currentTrial.attackMonitor.sessionRequestKeys.has(params.sessionId));
@@ -799,7 +1368,8 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                             'FALSE',
                             ...Array(14).fill(''),
                             SCENARIO,
-                            ...Array(ATTACK_FIELD_COUNT - 1).fill('')
+                            ...Array(ATTACK_FIELD_COUNT - 1).fill(''),
+                            ...Array(PREFAIL_FIELD_COUNT).fill('')
                         ];
                         fs.appendFileSync(OUTPUT_FILE, skipFields.map(toCsvValue).join(',') + '\n');
                     }
@@ -810,16 +1380,17 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                 await page.setViewport({ width: 1280, height: 20000 });
                 await applyThrottle(page);
                 const prUrls = PR_TARGET_CANDIDATES.filter((u) => u !== target.url).slice(0, 2);
+                // 追加ログはこの時点を原点にして相対 ms で出力する
+                const trialStart = Date.now();
                 currentTrial = {
+                    trialStart,
                     prUrls,
                     prStates: prUrls.map((url) => createPrState(url)),
                     prStatus: prUrls.map((url) => createPrStatusState(url)),
                     clickedAt: null,
-                    attackMonitor: createAttackMonitorState()
+                    attackMonitor: createAttackMonitorState(),
+                    prefailTimeline: createPrefailTimelineState()
                 };
-
-                // Prerender target logging state
-                const trialStart = Date.now();
 
                 const session = await page.target().createCDPSession();
                 await session.send('Network.enable');
@@ -832,6 +1403,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                 // Also watch network on top-level page (in case prerender requests leak here)
                 // Top-level page: still attach with URL-based fallback to catch leaks, but prerender sessions are keyed by session.
                 const cleanupTopNetwork = statusOnly ? null : attachNetworkListenersForSession(session);
+                const cleanupNormalTimeline = attachNormalNavigationTimelineListeners(session, currentTrial);
 
                 const handlePreloadStatus = (params) => {
                     if (!currentTrial) return;
@@ -841,6 +1413,15 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                     const st = currentTrial.prStatus[idx];
                     const status = params.status || '';
                     const final = params.prerenderStatus || '';
+                    pushPrefailTimelineEvent(currentTrial, {
+                        timestamp: Date.now(),
+                        event: 'pr_status',
+                        category: 'prerender',
+                        prIndex: idx,
+                        url,
+                        status,
+                        prerenderStatus: final
+                    });
                     if (status === 'Success' || final === 'Activated') {
                         st.status = 'success';
                         st.detectSource = 'Preload.prerenderStatusUpdated';
@@ -881,6 +1462,13 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
 
                             // cancel_delay シナリオでは depth 実クリック時刻を主指標として保存
                             currentTrial.clickedAt = Date.now();
+                            currentTrial.prefailTimeline.clickAt = currentTrial.clickedAt;
+                            pushPrefailTimelineEvent(currentTrial, {
+                                timestamp: currentTrial.clickedAt,
+                                event: 'click',
+                                category: 'click',
+                                url: target.url
+                            });
                             currentTrial.attackMonitor.clickDetectedAt = currentTrial.clickedAt;
                             currentTrial.attackMonitor.events.push({
                                 timestamp: currentTrial.clickedAt,
@@ -990,6 +1578,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                     });
 
                     const attackFields = toAttackCsvFields(currentTrial);
+                    const prefailFields = toPrefailCsvFields(currentTrial);
 
                     const csvLine = [
                         conditionName,
@@ -1000,7 +1589,8 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                         (metrics.size / 1024 / 1024).toFixed(2),
                         overall.status === 'success',
                         ...prFields,
-                        ...attackFields
+                        ...attackFields,
+                        ...prefailFields
                     ]
                         .map(toCsvValue)
                         .join(',') + '\n';
@@ -1058,6 +1648,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                     });
 
                     const attackFields = toAttackCsvFields(currentTrial);
+                    const prefailFields = toPrefailCsvFields(currentTrial);
 
                     const errorFields = [
                         conditionName,
@@ -1068,7 +1659,8 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                         0,
                         false,
                         ...prFields,
-                        ...attackFields
+                        ...attackFields,
+                        ...prefailFields
                     ];
                     fs.appendFileSync(OUTPUT_FILE, errorFields.map(toCsvValue).join(',') + '\n');
 
@@ -1077,6 +1669,7 @@ const printTrialTimeline = (trial, trialNo, targetName) => {
                     }
                 } finally {
                     cleanupTopNetwork && cleanupTopNetwork();
+                    cleanupNormalTimeline && cleanupNormalTimeline();
                     session.off('Preload.prerenderStatusUpdated', handlePreloadStatus);
                     await page.close();
                     currentTrial = null;
